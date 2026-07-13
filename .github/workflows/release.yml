@@ -1,0 +1,49 @@
+name: compile-chicken
+
+on:
+  push:
+    branches:
+      - main  
+
+permissions:
+  contents: write  
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout Source Code
+      uses: actions/checkout@v4
+
+    - name: Setup .NET SDK
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '8.0.x' # Matches your TargetFramework
+
+    - name: Restore Dependencies
+      run: dotnet restore
+
+    - name: Build and Publish Single-File EXE
+      run: |
+        dotnet publish ChickenClient.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:PublishReadyToRun=true -o ./publish
+
+    - name: Generate Release Version Tag
+      id: tag
+      shell: bash
+      run: |
+        # Creates a unique tag based on the run number (e.g., v1.0.4)
+        echo "version=v1.0.${{ github.run_number }}" >> $GITHUB_OUTPUT
+
+    - name: Create GitHub Release and Upload Artifact
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.tag.outputs.version }}
+        name: Release ${{ steps.tag.outputs.version }}
+        body: |
+          Automated compilation build for ChickenClient.
+          
+          Commit: ${{ github.sha }}
+        draft: false
+        prerelease: false
+        files: ./publish/ChickenClient.exe
