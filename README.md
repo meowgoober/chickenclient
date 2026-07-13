@@ -1,2 +1,2 @@
 # chickenclient
-expiremental irc client built on .net
+expiremental cli irc client built on .net
