@@ -58,7 +58,7 @@ while (_running)
     }
     else
     {
-        Logger.Warn("Not connected to a channel. Use /connect <server> and /join <channel> first.");
+        Logger.Warn("Not connected to a channel or user. Use /connect <server>, /join <channel>, or /switch <server> <target> first.");
     }
 }
 
@@ -67,7 +67,7 @@ while (_running)
 string BuildPrompt()
 {
     var server = _activeServer ?? "no-server";
-    var channel = _activeChannel ?? "no-channel";
+    var channel = _activeChannel ?? "status";
     
     // Dynamically retrieve your active nickname if connected to the current server
     string nick = "ChickenUser";
@@ -143,6 +143,22 @@ void SafeWriteLine(string text)
         Console.WriteLine(text);
 
         // 3. Redraw active entry line context perfectly intact
+        Console.Write(BuildPrompt() + _currentInput);
+    }
+}
+
+void ClearAndRedrawActiveBuffer()
+{
+    lock (_consoleLock)
+    {
+        Console.Clear();
+        if (_activeChannel != null && _channelMessages.TryGetValue(_activeChannel, out var channelInfo))
+        {
+            foreach (var message in channelInfo.Messages)
+            {
+                Console.WriteLine(message);
+            }
+        }
         Console.Write(BuildPrompt() + _currentInput);
     }
 }
@@ -229,6 +245,18 @@ async Task HandleCommandAsync(string cmd)
                 if (_activeServer != null && _connections[_activeServer]?.Connected == true)
                 {
                     await _connections[_activeServer]!.SendMessageAsync(target, message);
+                    
+                    // Track sent PMs in historical buffer
+                    if (!_channelMessages.ContainsKey(target))
+                        _channelMessages[target] = new ChannelInfo();
+                    
+                    var echo = $"<{_connections[_activeServer]!.CurrentNick}> {message}";
+                    _channelMessages[target].Messages.Add(echo);
+                    
+                    if (_activeChannel?.Equals(target, StringComparison.OrdinalIgnoreCase) == true)
+                    {
+                        SafeWriteLine(echo);
+                    }
                 }
                 else
                 {
@@ -314,8 +342,8 @@ void ShowHelp()
     SafeWriteLine("  /channels                      - List channels on current server");
     SafeWriteLine("");
     SafeWriteLine("  -- Navigation --");
-    SafeWriteLine("  /switch <server> [channel]     - Switch active server/channel");
-    SafeWriteLine("  /channel <name>                - Switch active channel");
+    SafeWriteLine("  /switch <server> [channel]     - Switch active server/channel or user PM context");
+    SafeWriteLine("  /channel <name>                - Switch active channel or user PM context");
     SafeWriteLine("");
     SafeWriteLine("  -- Communication --");
     SafeWriteLine("  /nick <newnick>                - Change your nickname");
@@ -330,7 +358,7 @@ void ShowHelp()
     SafeWriteLine("");
     SafeWriteLine("  ZNC Bouncer:");
     SafeWriteLine("    /bouncer add myznc znc.example.com 6697 myuser mypass network true");
-    SafeWriteLine("    /connect myznc");
+    SafeWriteLine("    /connect mync");
     SafeWriteLine("    /join #chat");
     SafeWriteLine("");
 }
@@ -555,7 +583,12 @@ async Task HandleConnectCommand(List<string> args)
 
     client.OnMessageReceived += msg =>
     {
+        // 1. Match typical channel routing [##channel] or [#channel]
         var channelMatch = System.Text.RegularExpressions.Regex.Match(msg, @"^\[(?<channel>[#&][^\]]+)\]");
+        
+        // 2. Extracted helper to process PM notifications mapping directly to a target destination
+        var pmMatch = System.Text.RegularExpressions.Regex.Match(msg, @"^\[(?<target>[^\]#&]+)\]\s+<(?<nick>[^>]+)>\s+(?<message>.+)$");
+
         if (channelMatch.Success)
         {
             var ch = channelMatch.Groups["channel"].Value;
@@ -568,9 +601,28 @@ async Task HandleConnectCommand(List<string> args)
                 SafeWriteLine(msg);
             }
         }
+        else if (pmMatch.Success)
+        {
+            var nick = pmMatch.Groups["nick"].Value;
+            var target = pmMatch.Groups["target"].Value;
+            
+            // Determine if the target context is us (incoming) or another person (outgoing)
+            string conversationKey = target.Equals(client.CurrentNick, StringComparison.OrdinalIgnoreCase) ? nick : target;
+
+            if (!_channelMessages.ContainsKey(conversationKey))
+                _channelMessages[conversationKey] = new ChannelInfo();
+            
+            _channelMessages[conversationKey].Messages.Add(msg);
+
+            if (_activeServer == serverName && _activeChannel?.Equals(conversationKey, StringComparison.OrdinalIgnoreCase) == true)
+            {
+                SafeWriteLine(msg);
+            }
+        }
         else
         {
-            if (_activeServer == serverName)
+            // Fallback status/server logging
+            if (_activeServer == serverName && (_activeChannel == null || _activeChannel == "status"))
             {
                 SafeWriteLine(msg);
             }
@@ -601,6 +653,7 @@ async Task HandleConnectCommand(List<string> args)
     if (config.AutoJoinChannels.Count > 0)
     {
         _activeChannel = config.AutoJoinChannels[0];
+        ClearAndRedrawActiveBuffer();
     }
 }
 
@@ -643,8 +696,9 @@ async Task HandleJoinCommand(List<string> args)
     await _connections[_activeServer]!.JoinChannelAsync(channel);
     if (!_channelMessages.ContainsKey(channel))
         _channelMessages[channel] = new ChannelInfo();
+    
     _activeChannel = channel;
-    SafeWriteLine($"Joined {channel}.");
+    ClearAndRedrawActiveBuffer();
 }
 
 async Task HandlePartCommand(List<string> args)
@@ -668,7 +722,8 @@ async Task HandlePartCommand(List<string> args)
 
     if (_activeChannel == channel)
     {
-        _activeChannel = null;
+        _activeChannel = "status";
+        ClearAndRedrawActiveBuffer();
     }
 }
 
@@ -677,20 +732,17 @@ void HandleChannelCommand(List<string> args)
     if (args.Count > 0)
     {
         var ch = args[0];
-        if (!ch.StartsWith('#')) ch = "#" + ch;
         _activeChannel = ch;
-        SafeWriteLine($"Switched to channel {ch}.");
+        ClearAndRedrawActiveBuffer();
         return;
     }
 
-    SafeWriteLine("Channels on current server:");
-    var serverChannels = _channelMessages.Keys
-        .Where(k => k.StartsWith("#") || k.StartsWith("&"))
-        .ToList();
+    SafeWriteLine("Channels/PMs on current server:");
+    var serverChannels = _channelMessages.Keys.ToList();
 
     if (serverChannels.Count == 0)
     {
-        SafeWriteLine("  (none joined)");
+        SafeWriteLine("  (none active)");
     }
     else
     {
@@ -706,7 +758,7 @@ void HandleSwitchCommand(List<string> args)
 {
     if (args.Count == 0)
     {
-        SafeWriteLine("Usage: /switch <server> [channel]");
+        SafeWriteLine("Usage: /switch <server> [channel/user]");
         SafeWriteLine("Current servers:");
         foreach (var kvp in _connections)
         {
@@ -725,10 +777,8 @@ void HandleSwitchCommand(List<string> args)
     }
 
     _activeServer = serverName;
-    _activeChannel = args.Count > 1 ? args[1] : null;
-    SafeWriteLine($"Switched to server '{serverName}'.");
-    if (_activeChannel != null)
-        SafeWriteLine($"Active channel: {_activeChannel}");
+    _activeChannel = args.Count > 1 ? args[1] : "status";
+    ClearAndRedrawActiveBuffer();
 }
 
 async Task HandleNickCommand(List<string> args)

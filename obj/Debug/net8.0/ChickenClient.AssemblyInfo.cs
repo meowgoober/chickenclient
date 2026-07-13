@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("ChickenClient")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+596633f209fe4443077e84799a0af1cc5aae4554")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+4a4145b1bb3808b0c47ddc8c25cf6d59d911f516")]
 [assembly: System.Reflection.AssemblyProductAttribute("ChickenClient")]
 [assembly: System.Reflection.AssemblyTitleAttribute("ChickenClient")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
