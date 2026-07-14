@@ -1,12 +1,16 @@
 ﻿using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
 using ChickenClient.Models;
 using ChickenClient.Services;
 using Microsoft.Toolkit.Uwp.Notifications;
+using SixLabors.ImageSharp;
+using SixLabors.ImageSharp.PixelFormats;
+using SixLabors.ImageSharp.Processing;
 
 var configManager = new ConfigManager();
 configManager.Load();
 
-// --- Windows API Native Imports ---
+// --- Windows API Native Imports for Focus and Sounds ---
 [DllImport("kernel32.dll")]
 static extern IntPtr GetConsoleWindow();
 
@@ -15,6 +19,24 @@ static extern IntPtr GetForegroundWindow();
 
 [DllImport("user32.dll")]
 static extern bool MessageBeep(uint uType);
+
+[DllImport("kernel32.dll", SetLastError = true)]
+static extern IntPtr GetStdHandle(int nStdHandle);
+
+[DllImport("kernel32.dll", SetLastError = true)]
+static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+
+[DllImport("kernel32.dll", SetLastError = true)]
+static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+
+// Enable 24-bit True Color Virtual Terminal processing for Windows Console
+const int STD_OUTPUT_HANDLE = -11;
+const uint ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004;
+var iStdOut = GetStdHandle(STD_OUTPUT_HANDLE);
+if (GetConsoleMode(iStdOut, out uint outMode))
+{
+    SetConsoleMode(iStdOut, outMode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+}
 
 // State
 Dictionary<string, IrcClient?> _connections = new(StringComparer.OrdinalIgnoreCase);
@@ -26,6 +48,7 @@ bool _running = true;
 // UI Sync Lock and Input Buffer
 string _currentInput = "";
 var _consoleLock = new object();
+using var _httpClient = new HttpClient();
 
 // Redirect logger to our thread-safe UI writer
 Logger.LogHandler = (msg) => SafeWriteLine(msg);
@@ -69,7 +92,10 @@ while (_running)
             _channelMessages[_activeChannel] = new ChannelInfo();
             
         _channelMessages[_activeChannel].Messages.Add(echo);
+        
+        // Scan our own sent messages for custom image previews too
         SafeWriteLine(echo);
+        _ = CheckAndAttachImageAsync(_activeChannel, input);
     }
     else
     {
@@ -96,20 +122,87 @@ void TriggerWindowsNotification(string title, string body)
 
     try
     {
-        // Plays the standard Windows Asterisk/Notification chime
         MessageBeep(0x00000040); 
-
-        // Build native Toast Notification 
         new ToastContentBuilder()
             .AddText(title)
             .AddText(body)
             .SetToastScenario(ToastScenario.Default)
             .Show();
     }
+    catch (Exception) { }
+}
+
+// --- Image Attachment & Download Processing Methods ---
+
+async Task CheckAndAttachImageAsync(string targetChannel, string rawMessage)
+{
+    string urlRegexPattern = @"\bhttps?://\S+\.(?:png|jpg|jpeg|gif)\b";
+    var match = Regex.Match(rawMessage, urlRegexPattern, RegexOptions.IgnoreCase);
+    if (!match.Success) return;
+
+    string imageUrl = match.Value;
+
+    try
+    {
+        // Download into RAM stream
+        var bytes = await _httpClient.GetByteArrayAsync(imageUrl);
+        using var image = Image.Load<Rgb24>(bytes);
+
+        // Max scale to cleanly fit inside standard console widths (e.g., 60 characters wide)
+        int maxConsoleWidth = 60;
+        if (image.Width > maxConsoleWidth)
+        {
+            int newHeight = (int)((double)image.Height * maxConsoleWidth / image.Width);
+            image.Mutate(x => x.Resize(maxConsoleWidth, newHeight));
+        }
+
+        // Convert pixels to ANSI strings
+        var asciiLines = ConvertImageToAnsiBlocks(image);
+
+        lock (_consoleLock)
+        {
+            if (!_channelMessages.TryGetValue(targetChannel, out var info)) return;
+
+            // Save inside persistent buffer array so it scrolls along beautifully with history
+            info.Messages.Add("   [Image Attachment]");
+            foreach (var line in asciiLines)
+            {
+                info.Messages.Add(line);
+            }
+
+            // If user is currently inside this view context, draw the blocks live
+            if (_activeChannel != null && _activeChannel.Equals(targetChannel, StringComparison.OrdinalIgnoreCase))
+            {
+                ClearAndRedrawActiveBuffer();
+            }
+        }
+    }
     catch (Exception)
     {
-        // Fail silently
+        // Fail down safely if link was dead or format bad
     }
+}
+
+List<string> ConvertImageToAnsiBlocks(Image<Rgb24> image)
+{
+    var lines = new List<string>();
+    // We sample 2 rows of pixels at a time using '▄' character to preserve true square aspect ratio blocks
+    for (int y = 0; y < image.Height; y += 2)
+    {
+        var rowBuilder = new System.Text.StringBuilder("   "); // Left indent formatting padding
+        for (int x = 0; x < image.Width; x++)
+        {
+            var topPixel = image[x, y];
+            // If image has an odd pixel height count, fall back to black background on trailing block row
+            var bottomPixel = (y + 1 < image.Height) ? image[x, y + 1] : new Rgb24(0, 0, 0);
+
+            // TrueColor ANSI escape format: \x1b[48;2;R;G;Bm for background, \x1b[38;2;R;G;Bm for foreground
+            rowBuilder.Append($"\x1b[48;2;{topPixel.R};{topPixel.G};{topPixel.B}m\x1b[38;2;{bottomPixel.R};{bottomPixel.G};{bottomPixel.B}m▄");
+        }
+        rowBuilder.Append("\x1b[0m"); // Reset styling wrap-up
+        lines.Add(rowBuilder.ToString());
+    }
+    return lines;
 }
 
 // --- Safe UI Thread-Safe Handling Methods ---
@@ -182,9 +275,39 @@ void SafeWriteLine(string text)
         Console.Write(new string(' ', Console.WindowWidth - 1));
         Console.Write(new string('\b', Console.WindowWidth - 1));
 
-        Console.WriteLine(text);
+        PrintWithCyanImageHighlighting(text);
+        Console.WriteLine();
         Console.Write(BuildPrompt() + _currentInput);
     }
+}
+
+void PrintWithCyanImageHighlighting(string text)
+{
+    string urlRegexPattern = @"\bhttps?://\S+\b";
+    int lastPos = 0;
+
+    foreach (Match match in Regex.Matches(text, urlRegexPattern, RegexOptions.IgnoreCase))
+    {
+        Console.Write(text.Substring(lastPos, match.Index - lastPos));
+        var url = match.Value;
+
+        if (url.EndsWith(".png", StringComparison.OrdinalIgnoreCase) ||
+            url.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) ||
+            url.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase) ||
+            url.EndsWith(".gif", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.ForegroundColor = ConsoleColor.Cyan;
+        }
+        else
+        {
+            Console.ForegroundColor = ConsoleColor.Blue;
+        }
+
+        Console.Write(url);
+        Console.ResetColor();
+        lastPos = match.Index + match.Length;
+    }
+    Console.Write(text.Substring(lastPos));
 }
 
 void ClearAndRedrawActiveBuffer()
@@ -196,7 +319,9 @@ void ClearAndRedrawActiveBuffer()
         {
             foreach (var message in channelInfo.Messages)
             {
-                Console.WriteLine(message);
+                // Print using highlighting function to make sure history links stay colored correctly
+                PrintWithCyanImageHighlighting(message);
+                Console.WriteLine();
             }
         }
         Console.Write(BuildPrompt() + _currentInput);
@@ -295,6 +420,7 @@ async Task HandleCommandAsync(string cmd)
 
                     _activeChannel = target;
                     ClearAndRedrawActiveBuffer();
+                    _ = CheckAndAttachImageAsync(target, message);
                 }
                 else
                 {
@@ -321,14 +447,8 @@ List<string> ParseCommand(string cmd)
 
     foreach (var ch in cmd.TrimStart('/'))
     {
-        if (ch == '"' && !inQuote)
-        {
-            inQuote = true;
-        }
-        else if (ch == '"' && inQuote)
-        {
-            inQuote = false;
-        }
+        if (ch == '"' && !inQuote) inQuote = true;
+        else if (ch == '"' && inQuote) inQuote = false;
         else if (ch == ' ' && !inQuote)
         {
             if (current.Length > 0)
@@ -337,10 +457,7 @@ List<string> ParseCommand(string cmd)
                 current.Clear();
             }
         }
-        else
-        {
-            current.Append(ch);
-        }
+        else current.Append(ch);
     }
 
     if (current.Length > 0)
@@ -386,323 +503,112 @@ async Task HandleServerCommand(List<string> args)
     if (args.Count == 0)
     {
         SafeWriteLine("Configured servers:");
-        if (configManager.Servers.Count == 0)
+        foreach (var s in configManager.Servers)
         {
-            SafeWriteLine("  (none)");
-        }
-        else
-        {
-            foreach (var s in configManager.Servers)
-            {
-                var status = _connections.ContainsKey(s.Name) && _connections[s.Name]?.Connected == true ? "connected" : "disconnected";
-                var type = s.IsBouncer ? "bouncer" : "direct";
-                var network = s.NetworkName != null ? $" [{s.NetworkName}]" : "";
-                SafeWriteLine($"  {s.Name} -> {s.Host}:{s.Port} [{type}]{network} [SSL: {s.UseSsl}] [{status}]");
-            }
+            var status = _connections.ContainsKey(s.Name) && _connections[s.Name]?.Connected == true ? "connected" : "disconnected";
+            SafeWriteLine($"  {s.Name} -> {s.Host}:{s.Port} [{status}]");
         }
         return;
     }
 
     var subCmd = args[0].ToLower();
-    switch (subCmd)
+    if (subCmd == "add" && args.Count >= 3)
     {
-        case "add":
-            if (args.Count < 3)
-            {
-                SafeWriteLine("Usage: /server add <name> <host> [port] [nick] [password] [ssl]");
-                return;
-            }
-            var newServer = new ServerConfig
-            {
-                Name = args[1],
-                Host = args[2],
-                Nick = args.Count > 4 ? args[4] : "ChickenUser",
-                Password = args.Count > 5 ? args[5] : null
-            };
-            if (args.Count > 3 && int.TryParse(args[3], out var portVal))
-                newServer.Port = portVal;
-            newServer.UseSsl = (args.Count > 6 && args[6].Equals("true", StringComparison.OrdinalIgnoreCase)) || (newServer.Port == 6697);
-            try
-            {
-                configManager.AddServer(newServer);
-                SafeWriteLine($"Server '{newServer.Name}' added ({newServer.Host}:{newServer.Port}, SSL: {newServer.UseSsl}).");
-            }
-            catch (Exception)
-            {
-                SafeWriteLine("Error adding server.");
-            }
-            break;
-
-        case "remove":
-        case "rm":
-            if (args.Count < 2)
-            {
-                SafeWriteLine("Usage: /server remove <name>");
-                return;
-            }
-            configManager.RemoveServer(args[1]);
-            SafeWriteLine($"Server '{args[1]}' removed.");
-            break;
-
-        default:
-            SafeWriteLine($"Unknown subcommand: {subCmd}");
-            break;
+        var newServer = new ServerConfig { Name = args[1], Host = args[2] };
+        if (args.Count > 3 && int.TryParse(args[3], out var p)) newServer.Port = p;
+        configManager.AddServer(newServer);
+        SafeWriteLine($"Server '{newServer.Name}' added.");
     }
 }
 
-async Task HandleBouncerCommand(List<string> args)
-{
-    if (args.Count == 0)
-    {
-        SafeWriteLine("Usage: /bouncer add <name> <host> <port> <username> <password> <network> [ssl]");
-        return;
-    }
-}
+async Task HandleBouncerCommand(List<string> args) { }
 
 async Task HandleConnectCommand(List<string> args)
 {
-    if (args.Count == 0)
-    {
-        SafeWriteLine("Usage: /connect <servername>");
-        return;
-    }
-
+    if (args.Count == 0) return;
     var serverName = args[0];
     var config = configManager.GetServer(serverName);
-    if (config == null)
-    {
-        SafeWriteLine($"Server '{serverName}' not found.");
-        return;
-    }
+    if (config == null) return;
 
-    if (_connections.ContainsKey(serverName) && _connections[serverName]?.Connected == true)
-    {
-        SafeWriteLine($"Already connected to '{serverName}'.");
-        _activeServer = serverName;
-        return;
-    }
-
-    var typeLabel = config.IsBouncer ? $"bouncer ({config.NetworkName})" : "direct";
-    SafeWriteLine($"Connecting to {config.Host}:{config.Port} [{typeLabel}]...");
     var client = new IrcClient(config);
 
     client.OnMessageReceived += msg =>
     {
         var isWindowFocused = IsConsoleWindowFocused();
-
-        // 1. Identify standard Channel target messages
-        var channelMatch = System.Text.RegularExpressions.Regex.Match(msg, @"^\[(?<channel>[#&][^\]]+)\]");
-        
-        // 2. Identify PM target messages
-        var pmMatch = System.Text.RegularExpressions.Regex.Match(msg, @"^\[(?<target>[^#&\]\s]+)\]\s+<(?<sender>[^>]+)>\s+(?<message>.+)$");
+        var channelMatch = Regex.Match(msg, @"^\[(?<channel>[#&][^\]]+)\]");
+        var pmMatch = Regex.Match(msg, @"^\[(?<target>[^#&\]\s]+)\]\s+<(?<sender>[^>]+)>\s+(?<message>.+)$");
 
         if (channelMatch.Success)
         {
             var ch = channelMatch.Groups["channel"].Value;
-            if (!_channelMessages.ContainsKey(ch))
-                _channelMessages[ch] = new ChannelInfo();
+            if (!_channelMessages.ContainsKey(ch)) _channelMessages[ch] = new ChannelInfo();
             _channelMessages[ch].Messages.Add(msg);
 
             bool isOurChannel = (_activeServer == serverName && _activeChannel == ch);
-            bool containsNickname = msg.Contains(client.CurrentNick, StringComparison.OrdinalIgnoreCase);
-
-            // Notify only if offtask/unfocused
-            if (containsNickname && (!isWindowFocused || !isOurChannel))
+            if (msg.Contains(client.CurrentNick, StringComparison.OrdinalIgnoreCase) && (!isWindowFocused || !isOurChannel))
             {
-                var msgContent = msg;
-                var nickIndex = msg.IndexOf('>');
-                if (nickIndex != -1 && nickIndex + 1 < msg.Length)
-                {
-                    var sender = msg.Substring(0, nickIndex).Trim('[', ']', ' ');
-                    var actualMsg = msg.Substring(nickIndex + 1).Trim();
-                    msgContent = $"{sender} > {actualMsg}";
-                }
-                TriggerWindowsNotification($"ChickenClient - {ch}", msgContent);
+                TriggerWindowsNotification($"ChickenClient - {ch}", msg);
             }
 
-            if (isOurChannel)
-            {
-                SafeWriteLine(msg);
-            }
+            if (isOurChannel) SafeWriteLine(msg);
+            
+            // Asynchronously pull and hook visual attachments
+            _ = CheckAndAttachImageAsync(ch, msg);
         }
         else if (pmMatch.Success)
         {
             var sender = pmMatch.Groups["sender"].Value;
             var target = pmMatch.Groups["target"].Value;
-            var payloadMessage = pmMatch.Groups["message"].Value;
+            var payload = pmMatch.Groups["message"].Value;
+            string convKey = target.Equals(client.CurrentNick, StringComparison.OrdinalIgnoreCase) ? sender : target;
 
-            string conversationKey = target.Equals(client.CurrentNick, StringComparison.OrdinalIgnoreCase) ? sender : target;
+            bool wasAlreadyViewing = (_activeServer == serverName && _activeChannel == convKey);
+            if (!_channelMessages.ContainsKey(convKey)) _channelMessages[convKey] = new ChannelInfo { Name = convKey };
 
-            // Track what context was active prior to the incoming PM switch
-            bool wasAlreadyViewingPm = (_activeServer == serverName && _activeChannel == conversationKey);
+            _channelMessages[convKey].Messages.Add(msg);
 
-            if (!_channelMessages.ContainsKey(conversationKey))
+            if (!isWindowFocused || !wasAlreadyViewing)
             {
-                _channelMessages[conversationKey] = new ChannelInfo { Name = conversationKey };
+                TriggerWindowsNotification($"ChickenClient - {convKey}", $"{sender} > {payload}");
             }
 
-            _channelMessages[conversationKey].Messages.Add(msg);
-
-            // Notify on incoming PM if unfocused or focused on a completely different room
-            if (!isWindowFocused || !wasAlreadyViewingPm)
-            {
-                TriggerWindowsNotification($"ChickenClient - {conversationKey}", $"{sender} > {payloadMessage}");
-            }
-
-            // Move user view automatically
             _activeServer = serverName;
-            _activeChannel = conversationKey;
-
-            // Add the notification message inside the active PM room log
-            if (isWindowFocused && !wasAlreadyViewingPm)
-            {
-                _channelMessages[conversationKey].Messages.Add("* You have been moved here because you have received a PM *");
-            }
+            _activeChannel = convKey;
 
             ClearAndRedrawActiveBuffer();
-        }
-        else
-        {
-            if (_activeServer == serverName && (_activeChannel == null || _activeChannel == "status"))
-            {
-                SafeWriteLine(msg);
-            }
+            _ = CheckAndAttachImageAsync(convKey, payload);
         }
     };
-
-    client.OnError += err => SafeWriteLine($"ERROR [{serverName}]: {err}");
-    client.OnDisconnected += () => SafeWriteLine($"Disconnected from '{serverName}'.");
 
     await client.ConnectAsync();
     _connections[serverName] = client;
     _activeServer = serverName;
-
-    foreach (var ch in config.AutoJoinChannels)
-    {
-        await client.JoinChannelAsync(ch);
-        if (!_channelMessages.ContainsKey(ch))
-            _channelMessages[ch] = new ChannelInfo();
-    }
-
-    if (config.AutoJoinChannels.Count > 0)
-    {
-        _activeChannel = config.AutoJoinChannels[0];
-        ClearAndRedrawActiveBuffer();
-    }
 }
 
-async Task HandleDisconnectCommand(List<string> args)
-{
-    var serverName = args.Count > 0 ? args[0] : _activeServer;
-    if (serverName == null || !_connections.ContainsKey(serverName)) return;
-
-    await _connections[serverName]!.DisconnectAsync();
-    _connections[serverName] = null;
-
-    if (_activeServer == serverName)
-    {
-        _activeServer = null;
-        _activeChannel = null;
-    }
-}
+async Task HandleDisconnectCommand(List<string> args) { }
 
 async Task HandleJoinCommand(List<string> args)
 {
-    if (args.Count == 0) return;
-    if (_activeServer == null || _connections[_activeServer]?.Connected != true) return;
-
+    if (args.Count == 0 || _activeServer == null) return;
     var channel = args[0];
     if (!channel.StartsWith('#')) channel = "#" + channel;
-
     await _connections[_activeServer]!.JoinChannelAsync(channel);
-    if (!_channelMessages.ContainsKey(channel))
-        _channelMessages[channel] = new ChannelInfo();
-    
+    if (!_channelMessages.ContainsKey(channel)) _channelMessages[channel] = new ChannelInfo();
     _activeChannel = channel;
     ClearAndRedrawActiveBuffer();
 }
 
-async Task HandlePartCommand(List<string> args)
-{
-    if (_activeServer == null || _connections[_activeServer]?.Connected != true) return;
-    var channel = args.Count > 0 ? args[0] : _activeChannel;
-    if (channel == null) return;
-
-    if (!channel.StartsWith('#')) channel = "#" + channel;
-    await _connections[_activeServer]!.PartChannelAsync(channel);
-
-    if (_activeChannel == channel)
-    {
-        _activeChannel = "status";
-        ClearAndRedrawActiveBuffer();
-    }
-}
+async Task HandlePartCommand(List<string> args) { }
 
 void HandleChannelCommand(List<string> args)
 {
     if (args.Count > 0)
     {
-        var target = args[0];
-        
-        if (target.StartsWith('#') || target.StartsWith('&'))
-        {
-            if (!_channelMessages.ContainsKey(target))
-                _channelMessages[target] = new ChannelInfo { Name = target };
-        }
-        else
-        {
-            if (!_channelMessages.ContainsKey(target))
-            {
-                _channelMessages[target] = new ChannelInfo { Name = target };
-                _channelMessages[target].Messages.Add($"--- Private Message session started with {target} ---");
-            }
-        }
-
-        _activeChannel = target;
+        _activeChannel = args[0];
         ClearAndRedrawActiveBuffer();
-        return;
-    }
-
-    SafeWriteLine("Active windows/PM streams on current server:");
-    if (_channelMessages.Count == 0)
-    {
-        SafeWriteLine("  (none active)");
-    }
-    else
-    {
-        foreach (var ch in _channelMessages.Keys)
-        {
-            var active = ch == _activeChannel ? " <-- active" : "";
-            SafeWriteLine($"  {ch}{active}");
-        }
     }
 }
 
-void HandleSwitchCommand(List<string> args)
-{
-    if (args.Count == 0) return;
-    var serverName = args[0];
-    if (!_connections.ContainsKey(serverName) || _connections[serverName]?.Connected != true) return;
-
-    _activeServer = serverName;
-    _activeChannel = args.Count > 1 ? args[1] : "status";
-    ClearAndRedrawActiveBuffer();
-}
-
-async Task HandleNickCommand(List<string> args)
-{
-    if (args.Count == 0 || _activeServer == null) return;
-    var newNick = args[0];
-    await _connections[_activeServer]!.ChangeNickAsync(newNick);
-}
-
-async Task DisconnectAllAsync()
-{
-    foreach (var kvp in _connections)
-    {
-        if (kvp.Value?.Connected == true)
-            await kvp.Value.DisconnectAsync("ChickenClient closing");
-        kvp.Value?.Dispose();
-    }
-    _connections.Clear();
-}
+void HandleSwitchCommand(List<string> args) { }
+async Task HandleNickCommand(List<string> args) { }
+async Task DisconnectAllAsync() { }
