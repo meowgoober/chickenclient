@@ -6,12 +6,15 @@ using Microsoft.Toolkit.Uwp.Notifications;
 var configManager = new ConfigManager();
 configManager.Load();
 
-// Windows API Native imports to determine window focus states
+// --- Windows API Native Imports ---
 [DllImport("kernel32.dll")]
 static extern IntPtr GetConsoleWindow();
 
 [DllImport("user32.dll")]
 static extern IntPtr GetForegroundWindow();
+
+[DllImport("user32.dll")]
+static extern bool MessageBeep(uint uType);
 
 // State
 Dictionary<string, IrcClient?> _connections = new(StringComparer.OrdinalIgnoreCase);
@@ -45,9 +48,9 @@ while (_running)
         {
             await HandleCommandAsync(input.Trim());
         }
-        catch (Exception ex)
+        catch (Exception)
         {
-            Logger.Error($"Error handling command: {ex.Message}");
+            Logger.Error("Error handling command.");
         }
     }
     else if (_activeServer != null && _activeChannel != null && _connections[_activeServer]?.Connected == true)
@@ -57,12 +60,11 @@ while (_running)
         {
             await _connections[_activeServer]!.SendMessageAsync(_activeChannel, input);
         }
-        catch (Exception ex)
+        catch (Exception)
         {
-            Logger.Error($"Error sending message: {ex.Message}");
+            Logger.Error("Error sending message.");
         }
         
-        // Track the sent message into the active context message history
         if (!_channelMessages.ContainsKey(_activeChannel))
             _channelMessages[_activeChannel] = new ChannelInfo();
             
@@ -80,7 +82,7 @@ while (_running)
 bool IsConsoleWindowFocused()
 {
     if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-        return true; // Fallback to avoid notifications spamming on other OS platforms
+        return true; 
 
     var consoleHandle = GetConsoleWindow();
     var foregroundHandle = GetForegroundWindow();
@@ -94,10 +96,10 @@ void TriggerWindowsNotification(string title, string body)
 
     try
     {
-        // Play standard Windows alert tone
-        Console.Beep();
+        // Plays the standard Windows Asterisk/Notification chime
+        MessageBeep(0x00000040); 
 
-        // Build native Toast Notification with standard Information scenario layout
+        // Build native Toast Notification 
         new ToastContentBuilder()
             .AddText(title)
             .AddText(body)
@@ -106,7 +108,7 @@ void TriggerWindowsNotification(string title, string body)
     }
     catch (Exception)
     {
-        // Fail silently so OS notification errors don't crash the IRC client
+        // Fail silently
     }
 }
 
@@ -291,7 +293,6 @@ async Task HandleCommandAsync(string cmd)
                     var echo = $"<{_connections[_activeServer]!.CurrentNick}> {message}";
                     _channelMessages[target].Messages.Add(echo);
 
-                    // Switch view to recipient stream
                     _activeChannel = target;
                     ClearAndRedrawActiveBuffer();
                 }
@@ -426,9 +427,9 @@ async Task HandleServerCommand(List<string> args)
                 configManager.AddServer(newServer);
                 SafeWriteLine($"Server '{newServer.Name}' added ({newServer.Host}:{newServer.Port}, SSL: {newServer.UseSsl}).");
             }
-            catch (Exception ex)
+            catch (Exception)
             {
-                SafeWriteLine($"Error adding server: {ex.Message}");
+                SafeWriteLine("Error adding server.");
             }
             break;
 
@@ -502,25 +503,21 @@ async Task HandleConnectCommand(List<string> args)
                 _channelMessages[ch] = new ChannelInfo();
             _channelMessages[ch].Messages.Add(msg);
 
-            // Highlight Notification Check: If the message contains our nick and we are in active view but minimized, OR we're focused on a different room entirely.
             bool isOurChannel = (_activeServer == serverName && _activeChannel == ch);
             bool containsNickname = msg.Contains(client.CurrentNick, StringComparison.OrdinalIgnoreCase);
 
-            if (containsNickname)
+            // Notify only if offtask/unfocused
+            if (containsNickname && (!isWindowFocused || !isOurChannel))
             {
-                if (!isWindowFocused || !isOurChannel)
+                var msgContent = msg;
+                var nickIndex = msg.IndexOf('>');
+                if (nickIndex != -1 && nickIndex + 1 < msg.Length)
                 {
-                    // Parse text cleanly for notification toast body
-                    var msgContent = msg;
-                    var nickIndex = msg.IndexOf('>');
-                    if (nickIndex != -1 && nickIndex + 1 < msg.Length)
-                    {
-                        var sender = msg.Substring(0, nickIndex).Trim('[', ']', ' ');
-                        var actualMsg = msg.Substring(nickIndex + 1).Trim();
-                        msgContent = $"{sender} > {actualMsg}";
-                    }
-                    TriggerWindowsNotification($"ChickenClient - {ch}", msgContent);
+                    var sender = msg.Substring(0, nickIndex).Trim('[', ']', ' ');
+                    var actualMsg = msg.Substring(nickIndex + 1).Trim();
+                    msgContent = $"{sender} > {actualMsg}";
                 }
+                TriggerWindowsNotification($"ChickenClient - {ch}", msgContent);
             }
 
             if (isOurChannel)
@@ -536,7 +533,8 @@ async Task HandleConnectCommand(List<string> args)
 
             string conversationKey = target.Equals(client.CurrentNick, StringComparison.OrdinalIgnoreCase) ? sender : target;
 
-            bool isCurrentlyViewingPm = (_activeServer == serverName && _activeChannel == conversationKey);
+            // Track what context was active prior to the incoming PM switch
+            bool wasAlreadyViewingPm = (_activeServer == serverName && _activeChannel == conversationKey);
 
             if (!_channelMessages.ContainsKey(conversationKey))
             {
@@ -545,18 +543,18 @@ async Task HandleConnectCommand(List<string> args)
 
             _channelMessages[conversationKey].Messages.Add(msg);
 
-            // Notify on incoming PM context if unfocused OR focused on a completely different room
-            if (!isWindowFocused || !isCurrentlyViewingPm)
+            // Notify on incoming PM if unfocused or focused on a completely different room
+            if (!isWindowFocused || !wasAlreadyViewingPm)
             {
                 TriggerWindowsNotification($"ChickenClient - {conversationKey}", $"{sender} > {payloadMessage}");
             }
 
-            // Automatic View Switching / Visual Transitions
+            // Move user view automatically
             _activeServer = serverName;
             _activeChannel = conversationKey;
 
-            // If we are focused on the app itself, log the transition warning message
-            if (isWindowFocused && !isCurrentlyViewingPm)
+            // Add the notification message inside the active PM room log
+            if (isWindowFocused && !wasAlreadyViewingPm)
             {
                 _channelMessages[conversationKey].Messages.Add("* You have been moved here because you have received a PM *");
             }
