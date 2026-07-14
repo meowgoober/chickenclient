@@ -1,8 +1,17 @@
-﻿using ChickenClient.Models;
+﻿using System.Runtime.InteropServices;
+using ChickenClient.Models;
 using ChickenClient.Services;
+using Microsoft.Toolkit.Uwp.Notifications;
 
 var configManager = new ConfigManager();
 configManager.Load();
+
+// Windows API Native imports to determine window focus states
+[DllImport("kernel32.dll")]
+static extern IntPtr GetConsoleWindow();
+
+[DllImport("user32.dll")]
+static extern IntPtr GetForegroundWindow();
 
 // State
 Dictionary<string, IrcClient?> _connections = new(StringComparer.OrdinalIgnoreCase);
@@ -63,6 +72,41 @@ while (_running)
     else
     {
         Logger.Warn("Not connected to a channel or PM context. Use /connect <server>, /join <channel>, or /query <user>.");
+    }
+}
+
+// --- Windows Notification Helper ---
+
+bool IsConsoleWindowFocused()
+{
+    if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        return true; // Fallback to avoid notifications spamming on other OS platforms
+
+    var consoleHandle = GetConsoleWindow();
+    var foregroundHandle = GetForegroundWindow();
+    return consoleHandle != IntPtr.Zero && consoleHandle == foregroundHandle;
+}
+
+void TriggerWindowsNotification(string title, string body)
+{
+    if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        return;
+
+    try
+    {
+        // Play standard Windows alert tone
+        Console.Beep();
+
+        // Build native Toast Notification with standard Information scenario layout
+        new ToastContentBuilder()
+            .AddText(title)
+            .AddText(body)
+            .SetToastScenario(ToastScenario.Default)
+            .Show();
+    }
+    catch (Exception)
+    {
+        // Fail silently so OS notification errors don't crash the IRC client
     }
 }
 
@@ -247,7 +291,7 @@ async Task HandleCommandAsync(string cmd)
                     var echo = $"<{_connections[_activeServer]!.CurrentNick}> {message}";
                     _channelMessages[target].Messages.Add(echo);
 
-                    // Automatic view transition to the recipient's PM stream
+                    // Switch view to recipient stream
                     _activeChannel = target;
                     ClearAndRedrawActiveBuffer();
                 }
@@ -412,7 +456,6 @@ async Task HandleBouncerCommand(List<string> args)
         SafeWriteLine("Usage: /bouncer add <name> <host> <port> <username> <password> <network> [ssl]");
         return;
     }
-    // Base implementation preserved...
 }
 
 async Task HandleConnectCommand(List<string> args)
@@ -444,10 +487,12 @@ async Task HandleConnectCommand(List<string> args)
 
     client.OnMessageReceived += msg =>
     {
+        var isWindowFocused = IsConsoleWindowFocused();
+
         // 1. Identify standard Channel target messages
         var channelMatch = System.Text.RegularExpressions.Regex.Match(msg, @"^\[(?<channel>[#&][^\]]+)\]");
         
-        // 2. Identify PM target messages (Where target does NOT start with # or &)
+        // 2. Identify PM target messages
         var pmMatch = System.Text.RegularExpressions.Regex.Match(msg, @"^\[(?<target>[^#&\]\s]+)\]\s+<(?<sender>[^>]+)>\s+(?<message>.+)$");
 
         if (channelMatch.Success)
@@ -457,7 +502,28 @@ async Task HandleConnectCommand(List<string> args)
                 _channelMessages[ch] = new ChannelInfo();
             _channelMessages[ch].Messages.Add(msg);
 
-            if (_activeServer == serverName && _activeChannel == ch)
+            // Highlight Notification Check: If the message contains our nick and we are in active view but minimized, OR we're focused on a different room entirely.
+            bool isOurChannel = (_activeServer == serverName && _activeChannel == ch);
+            bool containsNickname = msg.Contains(client.CurrentNick, StringComparison.OrdinalIgnoreCase);
+
+            if (containsNickname)
+            {
+                if (!isWindowFocused || !isOurChannel)
+                {
+                    // Parse text cleanly for notification toast body
+                    var msgContent = msg;
+                    var nickIndex = msg.IndexOf('>');
+                    if (nickIndex != -1 && nickIndex + 1 < msg.Length)
+                    {
+                        var sender = msg.Substring(0, nickIndex).Trim('[', ']', ' ');
+                        var actualMsg = msg.Substring(nickIndex + 1).Trim();
+                        msgContent = $"{sender} > {actualMsg}";
+                    }
+                    TriggerWindowsNotification($"ChickenClient - {ch}", msgContent);
+                }
+            }
+
+            if (isOurChannel)
             {
                 SafeWriteLine(msg);
             }
@@ -466,18 +532,35 @@ async Task HandleConnectCommand(List<string> args)
         {
             var sender = pmMatch.Groups["sender"].Value;
             var target = pmMatch.Groups["target"].Value;
+            var payloadMessage = pmMatch.Groups["message"].Value;
 
-            // Determine workspace alignment (If message is incoming target is our own Nick, meaning conversational tracking key is sender)
             string conversationKey = target.Equals(client.CurrentNick, StringComparison.OrdinalIgnoreCase) ? sender : target;
 
+            bool isCurrentlyViewingPm = (_activeServer == serverName && _activeChannel == conversationKey);
+
             if (!_channelMessages.ContainsKey(conversationKey))
+            {
                 _channelMessages[conversationKey] = new ChannelInfo { Name = conversationKey };
-            
+            }
+
             _channelMessages[conversationKey].Messages.Add(msg);
 
-            // Automatic window transition for incoming private notification messages
+            // Notify on incoming PM context if unfocused OR focused on a completely different room
+            if (!isWindowFocused || !isCurrentlyViewingPm)
+            {
+                TriggerWindowsNotification($"ChickenClient - {conversationKey}", $"{sender} > {payloadMessage}");
+            }
+
+            // Automatic View Switching / Visual Transitions
             _activeServer = serverName;
             _activeChannel = conversationKey;
+
+            // If we are focused on the app itself, log the transition warning message
+            if (isWindowFocused && !isCurrentlyViewingPm)
+            {
+                _channelMessages[conversationKey].Messages.Add("* You have been moved here because you have received a PM *");
+            }
+
             ClearAndRedrawActiveBuffer();
         }
         else
@@ -563,7 +646,6 @@ void HandleChannelCommand(List<string> args)
     {
         var target = args[0];
         
-        // Differentiate channels from standard username contexts
         if (target.StartsWith('#') || target.StartsWith('&'))
         {
             if (!_channelMessages.ContainsKey(target))
@@ -571,7 +653,6 @@ void HandleChannelCommand(List<string> args)
         }
         else
         {
-            // Initialize custom workspace tracker line for PM without sending a message
             if (!_channelMessages.ContainsKey(target))
             {
                 _channelMessages[target] = new ChannelInfo { Name = target };
