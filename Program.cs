@@ -148,8 +148,10 @@ async Task CheckAndAttachImageAsync(string targetChannel, string rawMessage)
         var bytes = await _httpClient.GetByteArrayAsync(imageUrl);
         using var image = Image.Load<Rgb24>(bytes);
 
-        // Max scale to cleanly fit inside standard console widths (e.g., 60 characters wide)
-        int maxConsoleWidth = 60;
+        // Dynamic Size Changer
+        int maxConsoleWidth = Math.Min(120, Console.WindowWidth - 8);
+        if (maxConsoleWidth < 30) maxConsoleWidth = 30; // Safety floor for tiny windows
+
         if (image.Width > maxConsoleWidth)
         {
             int newHeight = (int)((double)image.Height * maxConsoleWidth / image.Width);
