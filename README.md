@@ -5,7 +5,7 @@
 
 # ChickenClient
 
-ChickenClient is a lightweight, interactive terminal-based irc client written in c# that brings modern messaging features directly into your console.
+ChickenClient is a lightweight, interactive terminal-based irc client written in c# that brings modern IRC messaging features directly into your console.
 
 ---
 
